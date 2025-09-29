@@ -52,47 +52,68 @@ impl Config {
                 Ok(canonical_current_path)
             }
             Destination::Path(path) => {
-                // Handle file paths - extract the parent directory
-                if path.extension().is_some() || (!path.exists() && path.file_name().is_some()) {
-                    // This is likely a file path, get the parent directory
-                    if let Some(parent) = path.parent() {
-                        // Create parent directory if it doesn't exist
-                        if !parent.exists() {
+                // Check if the path is a directory or a file path
+                if path.exists() {
+                    // If it exists, it should be a directory
+                    if !path.is_dir() {
+                        // If it's a file, return its parent directory
+                        if let Some(parent) = path.parent() {
+                            if !parent.exists() {
+                                // Create parent directories if they don't exist
+                                fs::create_dir_all(parent)
+                                    .map_err(|err| Error::CreateFile(err))?;
+                            }
+                            
+                            let canonical_parent = parent
+                                .canonicalize()
+                                .map_err(|err| Error::CanonicalizeDestinationPath(parent.to_path_buf(), err))?;
+                            
+                            return Ok(canonical_parent);
+                        } else {
+                            return Err(Error::DestinationPathNotADirectory(path.clone()));
+                        }
+                    }
+                    
+                    // It's a directory that exists
+                    let canonical_path = path
+                        .canonicalize()
+                        .map_err(|err| Error::CanonicalizeDestinationPath(path.clone(), err))?;
+                    
+                    Ok(canonical_path)
+                } else {
+                    // Path doesn't exist
+                    // Check if it has an extension (likely a file path)
+                    if path.extension().is_some() {
+                        // It's probably a file path, get its parent directory
+                        if let Some(parent) = path.parent() {
+                            // Create parent directories if they don't exist
                             fs::create_dir_all(parent)
                                 .map_err(|err| Error::CreateFile(err))?;
+                            
+                            let canonical_parent = parent
+                                .canonicalize()
+                                .map_err(|err| Error::CanonicalizeDestinationPath(parent.to_path_buf(), err))?;
+                            
+                            return Ok(canonical_parent);
                         }
-                        
-                        // Return the parent directory
-                        let canonical_parent = parent
-                            .canonicalize()
-                            .map_err(|err| Error::CanonicalizeDestinationPath(parent.to_path_buf(), err))?;
-                        return Ok(canonical_parent);
                     }
-                }
-                
-                // Handle directory paths
-                if !path.exists() {
-                    // Create the directory if it doesn't exist
+                    
+                    // It's a directory path that doesn't exist, create it
                     fs::create_dir_all(path)
                         .map_err(|err| Error::CreateFile(err))?;
-                } else if !path.is_dir() {
-                    return Err(Error::DestinationPathNotADirectory(path.clone()));
+                    
+                    let canonical_path = path
+                        .canonicalize()
+                        .map_err(|err| Error::CanonicalizeDestinationPath(path.clone(), err))?;
+                    
+                    Ok(canonical_path)
                 }
-
-                let canonical_path = path
-                    .canonicalize()
-                    .map_err(|err| Error::CanonicalizeDestinationPath(path.clone(), err))?;
-
-                Ok(canonical_path)
             }
-            Destination::Stdout => {
-                Err(Error::StdoutNotValidDestination)
-            }
+            Destination::Stdout => Err(Error::StdoutNotValidDestination),
         }
     }
-}
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Destination {
     CurrentDir,
     Path(PathBuf),
@@ -228,10 +249,21 @@ pub async fn download_regular(
 
         _ => {
             let file_name = file.name.clone().unwrap_or_else(|| "unknown_file".to_string());
-            let root_path = config.canonical_destination_root()?;
-            let abs_file_path = root_path.join(&file_name);
+            
+            // Check if the destination is a file path (has extension or ends with a specific filename)
+            let abs_file_path = match &config.destination {
+                Destination::Path(path) if path.extension().is_some() || !path.exists() || !path.is_dir() => {
+                    // If the path has an extension or doesn't exist, treat it as a file path
+                    path.clone()
+                },
+                _ => {
+                    // Otherwise, join the file name to the destination directory
+                    let root_path = config.canonical_destination_root()?;
+                    root_path.join(&file_name)
+                }
+            };
 
-            println!("Downloading {}", file_name);
+            println!("Downloading {} to {}", file_name, abs_file_path.display());
             save_body_to_file(body, &abs_file_path, file.md5_checksum.clone()).await?;
             println!("Successfully downloaded {}", file_name);
         }

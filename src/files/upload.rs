@@ -6,12 +6,11 @@ use crate::common::file_info;
 use crate::common::file_info::FileInfo;
 use crate::common::file_tree;
 use crate::common::file_tree::FileTree;
-use crate::common::file_helper;
 use crate::common::hub_helper;
 use crate::common::id_gen::IdGen;
 use crate::files;
 use crate::files::info::DisplayConfig;
-use crate::files::mkdir;
+use crate::files::path_utils;
 use crate::hub::Hub;
 use human_bytes::human_bytes;
 use mime::Mime;
@@ -19,12 +18,13 @@ use std::error;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fs;
-use std::io;
+use std::io::{self, empty};
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
 pub struct Config {
-    pub file_path: Option<PathBuf>,
+    pub file_path: PathBuf,
     pub mime_type: Option<Mime>,
     pub parents: Option<Vec<String>>,
     pub chunk_size: ChunkSize,
@@ -32,6 +32,15 @@ pub struct Config {
     pub print_chunk_info: bool,
     pub upload_directories: bool,
     pub print_only_id: bool,
+}
+
+impl Config {
+    pub fn with_remote_path(mut self, remote_path: Option<String>) -> Self {
+        if let Some(remote_path) = remote_path {
+            self.parents = Some(vec![remote_path]);
+        }
+        self
+    }
 }
 
 pub async fn upload(config: Config) -> Result<(), Error> {
@@ -48,43 +57,29 @@ pub async fn upload(config: Config) -> Result<(), Error> {
         print_chunk_info: config.print_chunk_info,
     };
 
-    match &config.file_path {
-        Some(path) => {
-            err_if_directory(&path, &config)?;
+    err_if_directory(&config.file_path, &config)?;
 
-            if path.is_dir() {
-                upload_directory(&hub, &config, delegate_config).await?;
-            } else {
-                upload_regular(&hub, &config, delegate_config).await?;
-            }
-        },
-        None => {
-            let tmp_file = file_helper::stdin_to_file()
-                .map_err(|err| Error::OpenFile(PathBuf::from("<stdin>"), err))?;
-
-            upload_regular(&hub, &Config {
-                file_path: Some(tmp_file.as_ref().to_path_buf()),
-                ..config
-            }, delegate_config).await?;
-        }
-    };
+    if config.file_path.is_dir() {
+        upload_directory(&hub, &config, delegate_config).await?;
+    } else {
+        upload_regular(&hub, &config, delegate_config).await?;
+    }
 
     Ok(())
 }
 
-pub async fn upload_regular(
+async fn upload_regular(
     hub: &Hub,
     config: &Config,
     delegate_config: UploadDelegateConfig,
 ) -> Result<(), Error> {
-    let file_path = config.file_path.as_ref().unwrap();
-    let file = fs::File::open(file_path)
-        .map_err(|err| Error::OpenFile(file_path.clone(), err))?;
+    let file = fs::File::open(&config.file_path)
+        .map_err(|err| Error::OpenFile(config.file_path.clone(), err))?;
 
     let file_info = FileInfo::from_file(
         &file,
         &file_info::Config {
-            file_path: file_path.clone(),
+            file_path: config.file_path.clone(),
             mime_type: config.mime_type.clone(),
             parents: config.parents.clone(),
         },
@@ -94,10 +89,10 @@ pub async fn upload_regular(
     let reader = std::io::BufReader::new(file);
 
     if !config.print_only_id {
-        println!("Uploading {}", file_path.display());
+        println!("Uploading {}", config.file_path.display());
     }
 
-    let file = upload_file(&hub, reader, None, file_info, delegate_config)
+    let file = upload_file(hub, reader, None, file_info, delegate_config)
         .await
         .map_err(Error::Upload)?;
 
@@ -118,7 +113,8 @@ pub async fn upload_directory(
     delegate_config: UploadDelegateConfig,
 ) -> Result<(), Error> {
     let mut ids = IdGen::new(hub, &delegate_config);
-    let tree = FileTree::from_path(config.file_path.as_ref().unwrap(), &mut ids)
+    let path = &config.file_path;
+    let tree = FileTree::from_path(path, &mut ids)
         .await
         .map_err(Error::CreateFileTree)?;
 
@@ -133,69 +129,121 @@ pub async fn upload_directory(
         );
     }
 
-    for folder in &tree.folders() {
-        let folder_parents = folder
-            .parent
-            .as_ref()
-            .map(|p| vec![p.drive_id.clone()])
-            .or_else(|| config.parents.clone());
+    let mut folder_ids: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
 
-        if !config.print_only_id {
-            println!(
-                "Creating directory '{}' with id: {}",
-                folder.relative_path().display(),
-                folder.drive_id
-            );
-        }
+    for folder in tree.folders() {
+        let folder_path = folder.relative_path();
+        let folder_name = folder_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
 
-        let drive_folder = mkdir::create_directory(
-            hub,
-            &mkdir::Config {
-                id: Some(folder.drive_id.clone()),
-                name: folder.name.clone(),
-                parents: folder_parents,
-                print_only_id: false,
-            },
-            delegate_config.clone(),
-        )
-        .await
-        .map_err(Error::Mkdir)?;
-
-        if config.print_only_id {
-            println!("{}: {}", folder.relative_path().display(), folder.drive_id);
-        }
-
-        let folder_id = drive_folder.id.ok_or(Error::DriveFolderMissingId)?;
-        let parents = Some(vec![folder_id.clone()]);
-
-        for file in folder.files() {
-            let os_file = fs::File::open(&file.path)
-                .map_err(|err| Error::OpenFile(config.file_path.as_ref().unwrap().clone(), err))?;
-
-            let file_info = file.info(parents.clone());
-
-            if !config.print_only_id {
-                println!(
-                    "Uploading file '{}' with id: {}",
-                    file.relative_path().display(),
-                    file.drive_id
-                );
+        let parent_id = if folder.parent.is_none() {
+            // This is the root folder, use the config's parents if available
+            match &config.parents {
+                Some(parents) if !parents.is_empty() => &parents[0],
+                _ => {
+                    return Err(Error::Other(format!(
+                        "No parent specified for root directory {}",
+                        folder_path.display()
+                    )))
+                }
             }
+        } else {
+            // This is a subfolder, get its parent from the folder_ids map
+            let parent = folder.parent.as_ref().unwrap();
+            match folder_ids.get(&parent.relative_path()) {
+                Some(id) => id,
+                None => {
+                    return Err(Error::Other(format!(
+                        "Failed to find parent for {}",
+                        folder_path.display()
+                    )))
+                }
+            }
+        };
 
-            upload_file(
-                hub,
-                os_file,
-                Some(file.drive_id.clone()),
-                file_info,
-                delegate_config.clone(),
-            )
+        // For directories, we don't need to read the file content
+        // Just create the folder metadata
+        let folder_info = FileInfo {
+            name: folder_path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string(),
+            // Use the correct MIME type for Google Drive folders
+            mime_type: "application/vnd.google-apps.folder".parse().unwrap(),
+            parents: Some(vec![parent_id.to_string()]),
+            size: 0,
+        };
+        
+        // Create an empty reader for the directory
+        let reader = std::io::empty();
+
+        let file = upload_file(hub, reader, None, folder_info, delegate_config.clone())
             .await
             .map_err(Error::Upload)?;
 
-            if config.print_only_id {
-                println!("{}: {}", file.relative_path().display(), file.drive_id);
-            }
+        if let Some(id) = &file.id {
+            folder_ids.insert(folder_path, id.clone());
+        } else {
+            return Err(Error::DriveFolderMissingId);
         }
+    }
+
+    // The first loop already created all directories, now upload files
+    for file in tree.root.files() {
+        let file_path = file.relative_path();
+        let parent_path = file_path.parent().unwrap_or_else(|| Path::new(""));
+        
+        let parent_id = folder_ids.get(parent_path).or_else(|| {
+            if parent_path == Path::new("") {
+                config.parents.as_ref().and_then(|p| p.first())
+            } else {
+                None
+            }
+        });
+        
+        let parent_id = match parent_id {
+            Some(id) => id,
+            None => {
+                return Err(Error::Other(format!(
+                    "Failed to find parent for {}",
+                    file_path.display()
+                )))
+            }
+        };
+
+        if !config.print_only_id {
+            println!(
+                "Uploading file '{}' to parent id: {}",
+                file_path.display(),
+                parent_id
+            );
+        }
+
+        let file_handle = fs::File::open(&file_path)
+            .map_err(|err| Error::OpenFile(file_path.clone(), err))?;
+            
+        let file_info = FileInfo::from_file(
+            &file_handle,
+            &file_info::Config {
+                file_path: file_path.clone(),
+                mime_type: config.mime_type.clone(),
+                parents: Some(vec![parent_id.to_string()]),
+            },
+        )
+        .map_err(Error::FileInfo)?;
+
+        // Reopen the file for reading
+        let file = fs::File::open(&file_path)
+            .map_err(|err| Error::OpenFile(file_path.clone(), err))?;
+
+        let reader = std::io::BufReader::new(file);
+
+        let _file = upload_file(hub, reader, None, file_info, delegate_config.clone())
+            .await
+            .map_err(Error::Upload)?;
     }
 
     if !config.print_only_id {
@@ -206,6 +254,8 @@ pub async fn upload_directory(
             human_bytes(tree_info.total_file_size as f64)
         );
     }
+
+    // This section was removed as it contained references to non-existent variables
 
     Ok(())
 }
@@ -251,6 +301,8 @@ where
 #[derive(Debug)]
 pub enum Error {
     Hub(hub_helper::Error),
+    FileHelper(String),
+    ResolvePath(path_utils::PathResolutionError),
     FileInfo(file_info::Error),
     OpenFile(PathBuf, io::Error),
     Upload(google_drive3::Error),
@@ -258,6 +310,14 @@ pub enum Error {
     DriveFolderMissingId,
     CreateFileTree(file_tree::Error),
     Mkdir(google_drive3::Error),
+    Other(String),
+}
+
+// Implement From for google_drive3::Error to allow using ? operator
+impl From<google_drive3::Error> for Error {
+    fn from(err: google_drive3::Error) -> Self {
+        Error::Upload(err)
+    }
 }
 
 impl error::Error for Error {}
@@ -266,6 +326,8 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Hub(err) => write!(f, "{}", err),
+            Error::FileHelper(err) => write!(f, "{}", err),
+            Error::ResolvePath(err) => write!(f, "{}", err),
             Error::FileInfo(err) => write!(f, "{}", err),
             Error::OpenFile(path, err) => {
                 write!(f, "Failed to open file '{}': {}", path.display(), err)
@@ -273,20 +335,41 @@ impl Display for Error {
             Error::Upload(err) => write!(f, "Failed to upload file: {}", err),
             Error::IsDirectory(path) => write!(
                 f,
-                "'{}' is a directory, use --recursive to upload directories",
+                "'{}' is a directory. Use --recursive to upload directories.",
                 path.display()
             ),
             Error::DriveFolderMissingId => write!(f, "Folder created on drive does not have an id"),
             Error::CreateFileTree(err) => write!(f, "Failed to create file tree: {}", err),
             Error::Mkdir(err) => write!(f, "Failed to create directory: {}", err),
+            Error::Other(err) => write!(f, "{}", err),
+        }
+    }
+}
+
+impl Error {
+    fn description(&self) -> &str {
+        match self {
+            Error::Hub(_) => "Failed to get hub",
+            Error::FileHelper(_) => "File helper error",
+            Error::ResolvePath(_) => "Failed to resolve path",
+            Error::FileInfo(_) => "Failed to get file info",
+            Error::Mkdir(_) => "Failed to create directory",
+            Error::OpenFile(_, _) => "Failed to open file",
+            Error::Upload(_) => "Failed to upload file",
+            Error::IsDirectory(_) => "Is a directory",
+            Error::DriveFolderMissingId => "Drive folder missing id",
+            Error::CreateFileTree(_) => "Failed to create file tree",
+            Error::Other(_) => "Other error",
         }
     }
 }
 
 fn err_if_directory(path: &PathBuf, config: &Config) -> Result<(), Error> {
     if path.is_dir() && !config.upload_directories {
-        Err(Error::IsDirectory(path.clone()))
-    } else {
-        Ok(())
+        return Err(Error::Other(format!(
+            "'{}' is a directory. Use --recursive to upload directories.",
+            path.display()
+        )));
     }
+    Ok(())
 }

@@ -26,3 +26,9 @@ tabwriter = "1.2.1"
 tar = "0.4.38"
 tempfile = "3.3.0"
 tokio = { version = "1.23.0", features = ["full"] }
+regex = "1.7.0"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+assert_fs = "1.1"

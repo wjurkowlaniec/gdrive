@@ -205,6 +205,25 @@ impl ChunkSize {
             ChunkSize::Approx8192 => u64::pow(2, 33),
         }
     }
+    
+    pub fn from_mb(mb: u64) -> Self {
+        match mb {
+            0..=1 => ChunkSize::Approx1,
+            2..=3 => ChunkSize::Approx2,
+            4..=7 => ChunkSize::Approx4,
+            8..=15 => ChunkSize::Approx8,
+            16..=31 => ChunkSize::Approx16,
+            32..=63 => ChunkSize::Approx32,
+            64..=127 => ChunkSize::Approx64,
+            128..=255 => ChunkSize::Approx128,
+            256..=511 => ChunkSize::Approx256,
+            512..=1023 => ChunkSize::Approx512,
+            1024..=2047 => ChunkSize::Approx1024,
+            2048..=4095 => ChunkSize::Approx2048,
+            4096..=8191 => ChunkSize::Approx4096,
+            _ => ChunkSize::Approx8192,
+        }
+    }
 }
 
 impl FromStr for ChunkSize {
