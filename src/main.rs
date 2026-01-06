@@ -31,6 +31,7 @@ use crate::files::export::export;
 use mime::Mime;
 use std::error::Error;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None, disable_version_flag = true)]
@@ -986,9 +987,63 @@ async fn main() {
                     .await
                     .unwrap_or_else(handle_error)
             } else {
-                upload(config)
-                    .await
-                    .unwrap_or_else(handle_error)
+                // Check if file exists and update it, otherwise upload new
+                if !config.file_path.is_dir() {
+                    // For single files, check if exists and update
+                    let file_name = config.file_path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    
+                    let query = format!(
+                        "'{}' in parents and name = '{}' and trashed = false",
+                        folder_id, file_name
+                    );
+                    
+                    let list_config = files::list::ListFilesConfig {
+                        query: files::list::ListQuery::from_str(&query).unwrap_or_default(),
+                        order_by: Default::default(),
+                        max_files: 1,
+                    };
+                    
+                    match files::list::list_files(&hub, &list_config).await {
+                        Ok(existing_files) => {
+                            if !existing_files.is_empty() {
+                                // File exists, update it
+                                let existing_file_id = existing_files[0].id.as_ref().unwrap();
+                                println!("Updating existing file: {}", file_name);
+                                
+                                let update_config = files::update::Config {
+                                    file_id: existing_file_id.clone(),
+                                    file_path: Some(config.file_path.clone()),
+                                    mime_type: config.mime_type.clone(),
+                                    chunk_size: config.chunk_size.clone(),
+                                    print_chunk_errors: config.print_chunk_errors,
+                                    print_chunk_info: config.print_chunk_info,
+                                };
+                                
+                                files::update::update(update_config)
+                                    .await
+                                    .unwrap_or_else(handle_error);
+                            } else {
+                                // File doesn't exist, upload new
+                                upload(config)
+                                    .await
+                                    .unwrap_or_else(handle_error);
+                            }
+                        }
+                        Err(_) => {
+                            // Error checking for existing file, just upload
+                            upload(config)
+                                .await
+                                .unwrap_or_else(handle_error);
+                        }
+                    }
+                } else {
+                    // For directories, use regular upload (recursive directory handling)
+                    upload(config)
+                        .await
+                        .unwrap_or_else(handle_error);
+                }
             }
         }
 
